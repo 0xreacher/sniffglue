@@ -11,6 +11,7 @@ use sniffglue::sandbox;
 use sniffglue::sniff;
 use sniffglue::structs;
 use std::io::{self, IsTerminal, stdout};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -27,7 +28,7 @@ fn main() -> Result<()> {
     sandbox::activate_stage1(args.insecure_disable_seccomp)
         .context("Failed to init sandbox stage1")?;
 
-    let device = if let Some(dev) = args.device {
+    let device = if let Some(dev) = args.device.take() {
         dev
     } else {
         sniff::default_interface().context("Failed to find default interface")?
@@ -44,12 +45,17 @@ fn main() -> Result<()> {
     let colors = io::stdout().is_terminal();
     let config = fmt::Config::new(layout, args.verbose, colors);
 
-    let cap = if args.read {
+    
+    let filter = config.filter();
+
+    let is_file_read = args.read;
+
+    let cap = if is_file_read {
+       
         if args.threads.is_none() {
             debug!("Setting thread default to 1 due to -r");
             args.threads = Some(1);
         }
-
         let cap = sniff::open_file(&device)?;
         eprintln!("Reading from file: {:?}", device);
         cap
@@ -61,56 +67,107 @@ fn main() -> Result<()> {
                 immediate_mode: true,
             },
         )?;
-
-        let verbosity = config.filter().verbosity;
+        
+        if args.threads.is_none() {
+            debug!("Defaulting to 1 thread for live capture (acquisition is serialized)");
+            args.threads = Some(1);
+        }
         eprintln!(
             "Listening on device: {:?}, verbosity {}/4",
-            device, verbosity
+            device,
+            filter.verbosity
         );
         cap
     };
 
-    let threads = args.threads.unwrap_or_else(num_cpus::get);
+    let threads = args.threads.unwrap_or(1);
     debug!("Using {} threads", threads);
 
     let datalink = DataLink::from_linktype(cap.datalink())?;
 
-    let filter = config.filter();
-    let (tx, rx) = mpsc::sync_channel(256);
+    
+    let (tx, rx) = mpsc::sync_channel::<structs::raw::Packet>(256);
     let cap = Arc::new(Mutex::new(cap));
+
+    
+    let done = Arc::new(AtomicBool::new(false));
+
+    
+    let packet_count = Arc::new(AtomicU64::new(0));
 
     sandbox::activate_stage2(args.insecure_disable_seccomp)
         .context("Failed to init sandbox stage2")?;
+
+    let mut handles = Vec::with_capacity(threads);
 
     for _ in 0..threads {
         let cap = cap.clone();
         let datalink = datalink.clone();
         let filter = filter.clone();
         let tx = tx.clone();
-        thread::spawn(move || {
+        let done = done.clone();
+        let packet_count = packet_count.clone();
+
+        let handle = thread::spawn(move || {
             loop {
+                // Check if another thread already hit EOF — avoid hammering a
+                // dead capture with lock attempts.
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+
                 let packet = {
                     let mut cap = cap.lock().unwrap();
                     cap.next_pkt()
                 };
 
-                if let Ok(Some(packet)) = packet {
-                    let packet = centrifuge::parse(&datalink, &packet.data);
-                    if filter.matches(&packet) {
-                        tx.send(packet).unwrap()
+                match packet {
+                    Ok(Some(packet)) => {
+                        let parsed = centrifuge::parse(&datalink, &packet.data);
+                        if filter.matches(&parsed) {
+                            packet_count.fetch_add(1, Ordering::Relaxed);
+                            // If receiver hung up, shut down gracefully instead of panic
+                            if tx.send(parsed).is_err() {
+                                debug!("Receiver dropped, shutting down worker thread");
+                                break;
+                            }
+                        }
                     }
-                } else {
-                    debug!("End of packet stream, shutting down reader thread");
-                    break;
+                    Ok(None) => {
+                        debug!("End of packet stream, shutting down reader thread");
+                        // Signal all other threads to stop
+                        done.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    Err(e) => {
+                        debug!("Packet read error: {}, shutting down reader thread", e);
+                        done.store(true, Ordering::Relaxed);
+                        break;
+                    }
                 }
             }
         });
+
+        handles.push(handle);
     }
+
+    
     drop(tx);
 
     let format = config.format();
     for packet in rx.iter() {
         format.print(packet);
+    }
+
+    
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    
+    if is_file_read {
+        let count = packet_count.load(Ordering::Relaxed);
+        eprintln!("Done. {} packet(s) matched and displayed.", count);
     }
 
     Ok(())
